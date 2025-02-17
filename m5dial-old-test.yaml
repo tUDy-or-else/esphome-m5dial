@@ -1,0 +1,848 @@
+esphome:
+  name: m5dial
+  friendly_name: M5 Dial
+  on_boot:
+    then:
+      - pcf8563.read_time:
+  platformio_options:
+    board_build.flash_mode: dio
+
+esp32:
+  board: esp32-s3-devkitc-1
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+  on_client_connected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - delay: 1s
+          - lvgl.widget.hide: boot_screen
+          - lvgl.widget.show: hastatus
+          - lvgl.widget.show: city_bg_on 
+  on_client_disconnected:
+    - if:
+        condition:
+          lambda: 'return (0 == client_info.find("Home Assistant "));'
+        then:
+          - lvgl.widget.hide: hastatus
+          - lvgl.widget.show: city_bg_on
+
+ota:
+  - platform: esphome
+    password: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  manual_ip:
+    static_ip: xxxxxxxx
+    gateway: xxxxxxxxxxxx
+    subnet: xxxxxxxxxxxxxxxxx
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "M5Dial Fallback Hotspot"
+    password: "xxxxxxxxxxxxxx"
+
+captive_portal:
+
+time:
+  - platform: pcf8563
+    id: rtctime
+    address: 0x51
+    update_interval: never
+
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/London
+    servers:
+     - 0.pool.ntp.org
+     - 1.pool.ntp.org
+     - 2.pool.ntp.org
+    on_time_sync:
+      - script.execute: time_update
+    on_time:
+      - minutes: '*'
+        seconds: 0
+        then:
+          - script.execute: time_update
+
+  - platform: homeassistant
+    id: ha_time
+    on_time_sync:
+      then:
+        - pcf8563.write_time:
+
+script:
+  - id: time_update
+    then:
+      - lvgl.indicator.update:
+          id: minute_hand
+          value: !lambda |-
+            return id(ha_time).now().minute;
+      - lvgl.indicator.update:
+          id: hour_hand
+          value: !lambda |-
+            auto now = id(ha_time).now();
+            return std::fmod(now.hour, 12) * 60 + now.minute;
+      - lvgl.label.update:
+          id: date_label
+          text: !lambda |-
+            static const char * const mon_names[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
+            static char date_buf[8];
+            auto now = id(ha_time).now();
+            snprintf(date_buf, sizeof(date_buf), "%s %2d", mon_names[now.month-1], now.day_of_month);
+            return date_buf;
+      - lvgl.label.update:
+          id: day_label
+          text: !lambda |-
+            static const char * const day_names[] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
+            return day_names[id(ha_time).now().day_of_week - 1];
+
+external_components:
+  - source: github://dgaust/esphome@gc9a01
+    components: [ ft3267, gc9a01 ]
+    refresh: 0s
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+
+  - platform: wifi_signal # Reports the WiFi signal strength/RSSI in dB
+    name: "WiFi Signal dB"
+    id: wifi_signal_db
+    update_interval: 60s
+    entity_category: "diagnostic"
+
+  - platform: copy # Reports the WiFi signal strength in %
+    source_id: wifi_signal_db
+    name: "WiFi Signal Percent"
+    id: wifi_signal_prc
+    filters:
+      - lambda: return min(max(2 * (x + 100.0), 0.0), 100.0);
+    unit_of_measurement: "%"
+    entity_category: "diagnostic"
+
+  - platform: rotary_encoder
+    name: "Rotary Encoder"
+    id: rotaryencoder
+    resolution: 1
+    pin_a: 
+      number: GPIO40
+      mode:
+       input: true
+       pullup: true
+    pin_b: 
+      number: GPIO41
+      mode:
+       input: true
+       pullup: true
+    accuracy_decimals: 1
+    on_anticlockwise:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - logger.log: "LVGL resuming"
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - light.turn_on: backlight
+      - homeassistant.service:
+          service: media_player.volume_set
+          data_template:
+            entity_id: media_player.snake_coreplayer
+            volume_level: "{{ state_attr('media_player.snake_coreplayer', 'volume_level') | float - 0.035 }}"
+ 
+    on_clockwise: 
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - logger.log: "LVGL resuming"
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - light.turn_on: backlight
+      - homeassistant.service:
+          service: media_player.volume_set
+          data_template:
+            entity_id: media_player.snake_coreplayer
+            volume_level: "{{ state_attr('media_player.snake_coreplayer', 'volume_level') | float + 0.035 }}"
+
+  - platform: homeassistant
+    id: snake_sound_volume
+    entity_id: media_player.snake_coreplayer
+    attribute: volume_level
+    on_value: 
+      then:
+      - lvgl.arc.update:
+          id: arc_id1
+          value: !lambda return (x * 100);
+      - lvgl.label.update:
+          id: volume_label
+          text:
+            format: "%d%"
+            args: [ 'map(x*100,0,100,0,100)' ]
+            
+  - platform: homeassistant
+    id: media_state
+    entity_id: media_player.snake_coreplayer
+    attribute: state
+
+  - platform: homeassistant
+    id: outside_temperature
+    entity_id: weather.forecast_home
+    attribute: temperature
+    internal: true
+    on_value:
+      - lvgl.arc.update:
+          id: arc_id2
+          value: !lambda return x;
+      - lvgl.label.update:
+          id: label_temp
+          text:
+            format: "%.1f°"
+            args: [ 'x' ]
+
+  - platform: homeassistant
+    id: outside_humidity
+    entity_id: weather.forecast_home
+    attribute: humidity
+    internal: true
+    on_value:
+      - lvgl.arc.update:
+          id: arc_id3
+          value: !lambda return x;
+      - lvgl.label.update:
+          id: label_hum_text
+          text:
+            format: "Humidity %.0f%%"
+            args: [ 'x' ]
+
+  - platform: homeassistant
+    id: outside_pressure
+    entity_id: weather.forecast_home
+    attribute: pressure
+    internal: true
+    on_value:
+      - lvgl.label.update:
+          id: label_press_text
+          text:
+            format: "Pressure %.0f%"
+            args: [ 'x' ]
+
+binary_sensor:
+   - platform: status
+     name: "Node Status"
+     id: system_status
+
+   - platform: gpio
+     name: Button
+     id: backlightbutton
+     pin: GPIO42
+     filters:
+       - invert:
+       - delayed_on: 50ms
+     on_press:
+       - if:
+           condition: lvgl.is_paused
+           then:
+             - logger.log: "LVGL resuming"
+             - lvgl.resume:
+             - lvgl.widget.redraw: 
+             - light.turn_on: backlight
+       - lvgl.page.next:
+           animation: MOVE_BOTTOM
+           time: 250ms
+
+   - platform: gpio
+     name: Hold Button
+     pin: GPIO46
+
+   - platform: rc522
+     uid: 74-10-37-94
+     name: "NFC/RFID"
+
+   - platform: homeassistant
+     id: remote_volume
+     entity_id: media_player.snake_coreplayer_dlna
+     publish_initial_state: true
+     on_state:
+       then:
+         lvgl.widget.update:
+           id: vol_button
+           state:
+             checked: !lambda return x;
+
+number:
+  - platform: template
+    name: LVGL Screen timeout
+    optimistic: true
+    id: display_timeout
+    unit_of_measurement: "s"
+    initial_value: 45
+    restore_value: true
+    min_value: 10
+    max_value: 180
+    step: 5
+    mode: box
+
+text:
+  - platform: lvgl
+    name: fr_cond_icon
+    widget: lbl_weather_forecast_condition_icon
+    mode: text
+  - platform: lvgl
+    name: fr_cond_name
+    widget: lbl_weather_forecast_condition_name
+    mode: text
+
+button:
+  - platform: restart
+    name: "Restart"
+    id: m5d_restart
+
+i2c:
+  - id: internal_i2c
+    sda: GPIO11
+    scl: GPIO12
+
+rc522_i2c:
+  - id: nfc_reader
+    i2c_id: internal_i2c
+    address: 0x28
+
+output:
+  - platform: ledc
+    pin: GPIO3
+    id: buzzer
+  - platform: ledc
+    pin: GPIO9
+    id: backlight_output
+
+rtttl:
+  output: buzzer
+  id: buzz
+
+spi:
+  id: spi_bus
+  mosi_pin: GPIO5
+  clk_pin: GPIO6
+
+touchscreen:
+  - platform: ft3267
+    id: my_touchscreen
+    i2c_id: internal_i2c
+    address: 0x38
+    on_release:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - logger.log: "LVGL resuming"
+            - lvgl.resume:
+            - lvgl.widget.redraw:
+            - light.turn_on: backlight
+
+uart:
+  tx_pin: GPIO2
+  rx_pin: GPIO1
+  baud_rate: 256000
+  parity: NONE
+  stop_bits: 1
+
+light:
+  - platform: monochromatic
+    name: "Backlight"
+    output: backlight_output
+    id: backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 250ms
+
+display:
+  - platform: ili9xxx
+    id: my_lcd
+    model: GC9A01A
+    cs_pin: GPIO7
+    reset_pin: GPIO8
+    dc_pin: GPIO4
+    invert_colors: true
+    auto_clear_enabled: False
+    rotation: 0
+    dimensions: 
+      height: 240
+      width: 240
+
+lvgl:
+  on_idle:
+    timeout: !lambda "return (id(display_timeout).state * 1000);"
+    then:
+      - logger.log: "LVGL is idle"
+      - light.turn_off: backlight
+      - lvgl.pause:
+  top_layer:
+    widgets:
+      # make sure it's the last one in this list:
+      - obj:
+          id: boot_screen
+          x: 0
+          y: 0
+          width: 100%
+          height: 100%
+          bg_color: 0x000000
+          bg_opa: COVER
+          radius: 0
+          pad_all: 0
+          border_width: 0
+          widgets:
+            - spinner:
+                align: CENTER
+                y: 0
+                height: 70
+                width: 70
+                spin_time: 2s
+                arc_length: 60deg
+                arc_width: 8
+                arc_rounded: true
+                arc_opa: 30%
+                indicator:
+                  arc_color: ice_orange_color
+                  arc_width: 8
+          on_press:
+            - lvgl.widget.hide: boot_screen
+  encoders:
+    sensor: rotaryencoder
+    enter_button: backlightbutton
+    group: control_group
+  theme:
+    arc:
+      arc_color: very_dark_grey_color
+      knob:
+        bg_color: ice_orange_color
+      indicator:
+        arc_color: ha_amber
+        arc_width: 22
+    button:
+      text_font: montserrat_18
+    label:
+      text_font: montserrat_18
+      text_color: white_color
+
+  displays:
+    - my_lcd
+  touchscreens:
+    - my_touchscreen
+
+  pages:
+    - id: media_page
+      bg_color: 0x000000
+      widgets:
+        - label:
+            id: volume_label
+            align: CENTER
+            text: "--"
+            text_font: font1
+            text_color: my_grey
+
+        - button:
+            id: vol_button
+            bg_color: 0x000000
+            bg_opa: 0%
+            border_color: 0x000000
+            border_opa: 0%
+            checked:
+              bg_color: 0x000000
+              bg_opa: 0%
+              border_color: 0x000000
+              border_opa: 0%
+            width: 230
+            height: 230
+            radius: 3000
+            align: CENTER
+            checkable: true
+            on_click:
+              - homeassistant.service:
+                  service: media_player.media_play_pause
+                  data:
+                    entity_id: media_player.snake_coreplayer_dlna
+
+        - arc:
+            width: 240
+            height: 240
+            align: CENTER
+            group: control_group
+            arc_width: 16
+            indicator:
+              arc_color: my_green
+              arc_rounded: false
+              arc_width: 16
+            id: arc_id1
+            value: 0
+            min_value: 0
+            max_value: 100
+            adjustable: false
+            start_angle: 0
+            end_angle: 360
+            rotation: 90
+                  
+    - id: clock_page
+      widgets:
+        - obj: # clock container
+            height: 240
+            width: 240
+            align: CENTER
+            pad_all: 0
+            border_width: 0
+            bg_color: 0x000000
+            widgets:
+              - meter: # clock face
+                  height: 240
+                  width: 240
+                  align: CENTER
+                  bg_opa: TRANSP
+                  border_width: 0
+                  text_color: 0xFFFFFF
+                  scales:
+                    - range_from: 0 # minutes scale
+                      range_to: 60
+                      angle_range: 360
+                      rotation: 270
+                      ticks:
+                        width: 1
+                        count: 61
+                        length: 10
+                        color: 0xFFFFFF
+                      indicators:
+                        - line:
+                            id: minute_hand
+                            width: 3
+                            color: ice_orange_color
+                            r_mod: 0
+                            value: 0
+                    - range_from: 1 # hours scale for labels
+                      range_to: 12
+                      angle_range: 330
+                      rotation: 300
+                      ticks:
+                        width: 1
+                        count: 12
+                        length: 1
+                        major:
+                          stride: 1
+                          width: 4
+                          length: 10
+                          color: 0xC0C0C0
+                          label_gap: 12
+                    - range_from: 0 # hi-res hours scale for hand
+                      range_to: 720
+                      angle_range: 360
+                      rotation: 270
+                      ticks:
+                        count: 0
+                      indicators:
+                        - line:
+                            id: hour_hand
+                            width: 5
+                            color: ha_amber
+                            r_mod: -12
+                            value: 0
+              - obj:
+                  height: 130
+                  width: 130
+                  radius: 360
+                  align: CENTER
+                  border_width: 0
+                  pad_all: 0
+                  bg_color: 0x000000
+
+              - label:
+                  align: CENTER
+                  text_color: 0xFFFFFF
+                  id: day_label
+                  y: -12
+              - label:
+                  align: CENTER
+                  text_color: 0xFFFFFF
+                  id: date_label
+                  y: 12
+                  
+              - label:
+                  text: "\uF1EB"
+                  id: hastatus
+                  hidden: true
+                  align: CENTER
+                  y: -45
+                  text_align: right
+                  text_color: ice_green_color
+
+    - id: temperature_outside
+      bg_color: 0x000000
+      widgets:
+        - arc:
+            width: 239
+            height: 239
+            align: CENTER
+            arc_width: 22
+            end_angle: 263
+            id: arc_id2
+            value: 0
+            min_value: -10
+            max_value: 26
+            adjustable: false
+
+        - arc:
+            width: 239
+            height: 239
+            align: CENTER
+            arc_width: 22
+            start_angle: 277
+            end_angle: 45
+            mode: REVERSE
+            id: arc_id3
+            value: 0
+            min_value: 0
+            max_value: 100
+            adjustable: false
+            indicator:
+              arc_color: mid_blue_color
+ 
+        - meter:
+            id: meter1
+            height: 239
+            width: 239
+            align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            text_color: 0xFFFFFF
+            scales:
+              - range_from: -10
+                range_to: 26
+                angle_range: 128
+                rotation: 134
+                ticks:
+                  width: 1
+                  count: 2
+                  length: 5
+                  major:
+                    stride: 1
+                    width: 0
+                    length: 10
+                    color: 0x000000
+                    label_gap: -12
+
+        - meter:
+            id: meter2
+            height: 239
+            width: 239
+            align: CENTER
+            bg_opa: TRANSP
+            border_width: 0
+            text_color: 0xFFFFFF
+            scales:
+              - range_from: 100
+                range_to: 0
+                angle_range: 126
+                rotation: 280
+                ticks:
+                  width: 1
+                  count: 2
+                  length: 5
+                  major:
+                    stride: 1
+                    width: 0
+                    length: 10
+                    color: 0x000000
+                    label_gap: -12
+
+        - obj:
+            height: 20
+            width: 20
+            radius: 360
+            align: CENTER
+            border_width: 0
+            pad_all: 0
+            bg_color: 0x000000
+
+        - label:
+            id: label_temp
+            text: "-.-°"
+            text_font: montserrat_48
+            align: CENTER
+            y: 0
+
+        - label:
+            id: label_hum_text
+            text: "----"
+            text_font: montserrat_16
+            align: CENTER
+            y: 33
+
+        - label:
+            id: label_press_text
+            text: "----"
+            text_font: montserrat_16
+            align: CENTER
+            y: 55
+
+        - line:
+            id: city_bg
+            points:
+              - 66, 206
+              - 172, 207
+            line_width: 21
+            line_color: very_dark_grey_color
+            line_rounded: true
+
+        - line:
+            id: city_bg_on
+            points:
+              - 66, 206
+              - 172, 207
+            line_width: 21
+            line_color: mid_green_color
+            line_rounded: true
+            hidden: true
+
+        - label:
+            id: city
+            text: "KIRKWALL"
+            text_font: montserrat_20
+            align: BOTTOM_MID
+            y: -22
+
+        - label:
+            text: "\U000F14E4"
+            id: lbl_weather_forecast_condition_icon
+            text_font: icons_50
+            align: TOP_MID
+            y: 28
+
+        - label:
+            text: "Unknown"
+            id: lbl_weather_forecast_condition_name
+            align: CENTER
+            text_font: montserrat_16
+            y: -35
+
+color:
+  - id: white_color
+    hex: "FFFFFF"
+  - id: very_dark_grey_color
+    hex: "272828"
+  - id: light_grey_color
+    hex: "575858"
+
+  # Green Colors
+  - id: ice_green_color
+    hex: "8ab65e"
+  - id: ligt_green_color
+    hex: "6e914b"
+  - id: mid_green_color
+    hex: "526d38"
+  - id: dark_green_color
+    hex: "374825"
+
+  # Blue Colors
+  - id: ice_blue_color
+    hex: "739BD0"
+  - id: light_blue_color
+    hex: "5c7ca6"
+  - id: mid_blue_color
+    hex: "455d7c"
+  - id: dark_blue_color
+    hex: "2e3e53"
+
+  # Red Colors
+  - id: ice_red_color
+    hex: "fc6d6d"
+  - id: light_red_color
+    hex: "c95757"
+  - id: mid_red_color
+    hex: "974141"
+  - id: dark_red_color
+    hex: "642b2b"
+
+  # Orange Colors
+  - id: ice_orange_color
+    hex: "ef9c5d"
+  - id: light_orange_color
+    hex: "bf7c4a"
+  - id: mid_orange_color
+    hex: "8f5d37"
+  - id: dark_orange_color
+    hex: "5f3e25"
+  - id: ha_amber
+    hex: "f86f15"
+  - id: m5_orange
+    hex: "ff860b"
+
+  - id: my_red
+    red: 100%
+    green: 3%
+    blue: 5%
+  - id: my_grey
+    red: 65%
+    green: 65%
+    blue: 65%
+  - id: my_grey2
+    red: 45%
+    green: 45%
+    blue: 45%
+  - id: my_green
+    red: 0%
+    green: 58%
+    blue: 0%
+  - id: my_amber
+    red: 100%
+    green: 43%
+    blue: 8%
+  - id: ha_blue
+    red: 7%
+    green: 69%
+    blue: 89%
+
+font:
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: icons_50
+    size: 50
+    bpp: 4
+    glyphs: [
+      "\U000F0594", # clear-night
+      "\U000F0590", # cloudy
+      "\U000F0F2F", # exceptional
+      "\U000F0591", # fog
+      "\U000F0592", # hail
+      "\U000F0593", # lightning
+      "\U000F067E", # lightning-rainy
+      "\U000F0595", # partlycloudy
+      "\U000F0596", # pouring
+      "\U000F0597", # rainy
+      "\U000F0598", # snowy
+      "\U000F067F", # snowy-rainy
+      "\U000F0599", # sunny
+      "\U000F059D", # windy
+      "\U000F059E", # windy-variant
+      "\U000F14E4", # sunny-off
+      ]
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: icons_autom
+    size: 100
+    bpp: 4
+    glyphs: [
+      "\U000F0839", # mdi-tv
+      "\U000F0594", # mdi-night
+      ]
+
+  - file: "gfonts://Archivo Black"
+    id: font2
+    size: 78
+
+  - file: "gfonts://Concert One"
+    id: font1
+    size: 100
